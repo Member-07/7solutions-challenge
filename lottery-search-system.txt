@@ -1,0 +1,165 @@
+ข้อ 1: Data Volume
+Requirement: รองรับ Lottery Ticket 10 ล้านรายการ และแต่ละ Ticket เป็นเลข 6 หลัก
+
+Design
+ใช้ PostgreSQL เป็น Database หลัก และเก็บ Ticket 1 รายการต่อ 1 row
+
+tickets
+--------------------------------
+ticket_id
+ticket_number
+d0
+d1
+d2
+d3
+d4
+d5
+status
+reserved_by
+reserved_until
+
+โดย d0-d5 คือเลขแต่ละหลักของ Ticket
+
+ตัวอย่าง:
+
+123456
+
+d0 = 1
+d1 = 2
+d2 = 3
+d3 = 4
+d4 = 5
+d5 = 6
+
+เหตุผล
+10 ล้าน records ยังเป็นขนาดที่ PostgreSQL รองรับได้
+
+d0-d5 ช่วยให้ค้นหา Pattern ได้โดยตรง
+
+ไม่ต้องสร้าง Search Index แยกอีก 60 ล้าน rows
+
+PostgreSQL เป็น Source of Truth สำหรับข้อมูล Ticket และสถานะ
+
+ข้อ 2: Search Pattern
+Requirement: Pattern มี 6 ตัวอักษร ประกอบด้วยตัวเลขและ *
+
+ตัวอย่าง:
+
+****23
+1****5
+123***
+
+Design
+เก็บเลขแต่ละหลักเป็น field:
+
+d0 d1 d2 d3 d4 d5
+
+แล้วแปลง Pattern เป็นเงื่อนไขเฉพาะตำแหน่งที่เป็นตัวเลข
+
+ข้อ 3: Result Distribution 
+ใช้ Redis จอง Ticket ชั่วคราว เพื่อป้องกัน Ticket เดียวกันถูกแจกให้หลาย User พร้อมกัน ถ้าจองไม่ได้ให้เลือก Ticket ถัดไป
+
+
+ข้อ 4: Performance
+เพื่อรองรับ 10M+ records จะเก็บเลขแต่ละหลักเป็น d0-d5 และสร้าง Database Index เพื่อหลีกเลี่ยง Full Table Scan โดย Pattern จะถูกแปลงเป็นเงื่อนไขเฉพาะตำแหน่งที่เป็นตัวเลข ใช้ LIMIT เพื่อลดจำนวนที่ต้องประมวลผล และ Replica เพื่อกระจาย Search workload เมื่อจำนวน Read สูง โดยให้ Primary รับ Write 
+
+ข้อ 5:Real-World Design Proposal
+1. Database / Storage
+เลือก PostgreSQL เป็น Database หลัก
+
+เก็บ Ticket เป็น 1 row และแยกเลข 6 หลักเป็น:
+
+ticket_id
+ticket_number
+d0 d1 d2 d3 d4 d5
+status
+
+เหตุผล:
+
+รองรับข้อมูลระดับ 10M+ records ได้
+
+มี Index และ Transaction/Concurrency Control
+
+เป็น Source of Truth ของ Ticket
+
+มี Read Replica เพิ่มได้เมื่อ Search traffic สูง
+
+ใช้ Redis เพิ่มสำหรับ Temporary Reservation เพราะต้องการความเร็วและ Atomic Operation
+
+2. Wildcard Search
+ไม่ใช้การ Search แบบ String เช่น LIKE '%23'
+
+แต่แยกเลขแต่ละหลักเป็น d0-d5 และสร้าง Index เพื่อค้นหาเฉพาะตำแหน่งที่เป็นตัวเลข
+
+ตัวอย่าง:
+
+Pattern = 1****5
+
+→ d0 = 1
+→ d5 = 5
+
+หรือ
+
+Pattern = 123***
+
+→ d0 = 1
+→ d1 = 2
+→ d2 = 3
+
+* หมายถึงไม่ต้องใส่เงื่อนไข
+
+ใช้ LIMIT เพื่อดึง Candidate มาเป็นชุด ไม่ต้องดึง Ticket ที่ Match ทั้งหมด
+
+3. Duplicate Prevention
+หลังจาก PostgreSQL หา Candidate แล้ว ใช้ Redis Atomic Reservation
+
+PostgreSQL
+    ↓
+Candidate Tickets
+    ↓
+Redis Reservation
+    ↓
+Success → Assign
+Fail    → Try next candidate
+
+ใช้ Ticket ID เป็น Redis Key เช่น:
+
+reservation:{ticket_id}
+
+และใช้ Atomic operation เช่น SET NX พร้อม TTL
+
+ดังนั้นถ้า A และ B ได้ Candidate 123001 เหมือนกัน:
+
+A → Reserve 123001 → SUCCESS
+B → Reserve 123001 → FAIL
+B → Try 123002   → SUCCESS
+
+จึงป้องกันไม่ให้ Ticket เดียวกันถูก Allocate ให้หลาย User พร้อมกัน
+
+
+                  User
+                   │
+                   ▼
+              Search Pattern
+                   │
+                   ▼
+        ┌────────────────────┐
+        │ PostgreSQL         │
+        │ d0 ... d5 + Index  │
+        └─────────┬──────────┘
+                  │
+             Candidates
+                  │
+                  ▼
+        ┌────────────────────┐
+        │ Redis              │
+        │ Atomic Reservation │
+        │ TTL                │
+        └─────────┬──────────┘
+                  │
+            ┌─────┴─────┐
+            ▼           ▼
+         Success       Fail
+            │           │
+            ▼           ▼
+        Assign User   Next Candidate
